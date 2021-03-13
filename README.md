@@ -1,9 +1,9 @@
 # gophertunnel
-> A Minecraft library used for creating proxies, servers, clients and tools.
+> Swiss army knife for Minecraft (Bedrock Edition) software written in Go
 
-[Module Documentation](https://pkg.go.dev/mod/github.com/sandertv/gophertunnel)
+[![PkgGoDev](https://pkg.go.dev/badge/github.com/sandertv/gophertunnel)](https://pkg.go.dev/github.com/sandertv/gophertunnel)
 
-![telescope gopher](https://github.com/Sandertv/gophertunnel/blob/master/gophertunnel_telescope_coloured.png)
+![telescope gopher](https://raw.githubusercontent.com/Sandertv/gophertunnel/master/gophertunnel_telescope_coloured.png)
 
 ## Overview
 gophertunnel is composed of several packages that may be of use for creating Minecraft related tools. A brief
@@ -34,6 +34,7 @@ versions for past Minecraft versions is listed below.
 Gophertunnel is sponsored by all my gopher sponsors. A special thanks goes to the Very Important Gophers below.
 
 <a href="https://github.com/TwistedAsylumMC"><img src="https://avatars3.githubusercontent.com/u/30378179?s=400&u=49eabab31601b6bf5b0024c05c2556bc7f5b3e3b&v=4" width="60" height="60"></a>
+<a href="https://github.com/AndreasHGK"><img src="https://avatars2.githubusercontent.com/u/36563463?s=400&u=e2c20031872bd0b5eed292e1d81ceb5c5775f36d&v=4" width="60" height="60"></a>
 
 ## Contact
 [![Chat on Discord](https://img.shields.io/badge/Chat-On%20Discord-738BD7.svg?style=for-the-badge)](https://discord.gg/evzQR4R)

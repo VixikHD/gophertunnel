@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"fmt"
 )
 
@@ -14,6 +15,9 @@ type ItemStackRequest struct {
 	// Actions is a list of actions performed by the client. The actual type of the actions depends on which
 	// ID was present, and is one of the concrete types below.
 	Actions []StackRequestAction
+	// CustomNames is a list of custom names involved in the request. This is typically filled with one string
+	// when an anvil is used.
+	CustomNames []string
 }
 
 // WriteStackRequest writes an ItemStackRequest x to Writer w.
@@ -48,6 +52,8 @@ func WriteStackRequest(w *Writer, x *ItemStackRequest) {
 			id = StackRequestActionCraftRecipeAuto
 		case *CraftCreativeStackRequestAction:
 			id = StackRequestActionCraftCreative
+		case *CraftRecipeOptionalStackRequestAction:
+			id = StackRequestActionCraftRecipeOptional
 		case *CraftNonImplementedStackRequestAction:
 			id = StackRequestActionCraftNonImplementedDeprecated
 		case *CraftResultsDeprecatedStackRequestAction:
@@ -57,6 +63,11 @@ func WriteStackRequest(w *Writer, x *ItemStackRequest) {
 		}
 		w.Uint8(&id)
 		action.Marshal(w)
+	}
+	l = uint32(len(x.CustomNames))
+	w.Varuint32(&l)
+	for _, n := range x.CustomNames {
+		w.String(&n)
 	}
 }
 
@@ -98,6 +109,8 @@ func StackRequest(r *Reader, x *ItemStackRequest) {
 			action = &AutoCraftRecipeStackRequestAction{}
 		case StackRequestActionCraftCreative:
 			action = &CraftCreativeStackRequestAction{}
+		case StackRequestActionCraftRecipeOptional:
+			action = &CraftRecipeOptionalStackRequestAction{}
 		case StackRequestActionCraftNonImplementedDeprecated:
 			action = &CraftNonImplementedStackRequestAction{}
 		case StackRequestActionCraftResultsDeprecated:
@@ -109,14 +122,29 @@ func StackRequest(r *Reader, x *ItemStackRequest) {
 		action.Unmarshal(r)
 		x.Actions[i] = action
 	}
+
+	r.Varuint32(&count)
+	r.LimitUint32(count, 64)
+
+	x.CustomNames = make([]string, count)
+	for i := uint32(0); i < count; i++ {
+		r.String(&x.CustomNames[i])
+	}
 }
+
+const (
+	ItemStackResponseStatusOK = iota
+	ItemStackResponseStatusError
+	// There are lots more of these statuses for specific errors, but they don't seem to be very useful.
+)
 
 // ItemStackResponse is a response to an individual ItemStackRequest.
 type ItemStackResponse struct {
-	// Success specifies if the request with the RequestID below was successful. If this is the case, the
+	// Status specifies if the request with the RequestID below was successful. If this is the case, the
 	// ContainerInfo below will have information on what slots ended up changing. If not, the container info
 	// will be empty.
-	Success bool
+	// A non-0 status means an error occurred and will result in the action being reverted.
+	Status uint8
 	// RequestID is the unique ID of the request that this response is in reaction to. If rejected, the client
 	// will undo the actions from the request with this ID.
 	RequestID int32
@@ -145,13 +173,15 @@ type StackResponseSlotInfo struct {
 	Count byte
 	// StackNetworkID is the network ID of the new stack at a specific slot.
 	StackNetworkID int32
+	// CustomName is the custom name of the item stack. It is used in relation to text filtering.
+	CustomName string
 }
 
 // WriteStackResponse writes an ItemStackResponse x to Writer w.
 func WriteStackResponse(w *Writer, x *ItemStackResponse) {
-	w.Bool(&x.Success)
+	w.Uint8(&x.Status)
 	w.Varint32(&x.RequestID)
-	if !x.Success {
+	if x.Status != ItemStackResponseStatusOK {
 		return
 	}
 	l := uint32(len(x.ContainerInfo))
@@ -164,9 +194,9 @@ func WriteStackResponse(w *Writer, x *ItemStackResponse) {
 // StackResponse reads an ItemStackResponse x from Reader r.
 func StackResponse(r *Reader, x *ItemStackResponse) {
 	var l uint32
-	r.Bool(&x.Success)
+	r.Uint8(&x.Status)
 	r.Varint32(&x.RequestID)
-	if !x.Success {
+	if x.Status != ItemStackResponseStatusOK {
 		return
 	}
 	r.Varuint32(&l)
@@ -208,6 +238,7 @@ func StackSlotInfo(r IO, x *StackResponseSlotInfo) {
 	if x.Slot != x.HotbarSlot {
 		r.InvalidValue(x.HotbarSlot, "hotbar slot", "hot bar slot must be equal to normal slot")
 	}
+	r.String(&x.CustomName)
 }
 
 // StackRequestAction represents a single action related to the inventory present in an ItemStackRequest.
@@ -234,6 +265,7 @@ const (
 	StackRequestActionCraftRecipe
 	StackRequestActionCraftRecipeAuto
 	StackRequestActionCraftCreative
+	StackRequestActionCraftRecipeOptional
 	StackRequestActionCraftNonImplementedDeprecated
 	StackRequestActionCraftResultsDeprecated
 )
@@ -444,6 +476,34 @@ func (a *CraftCreativeStackRequestAction) Marshal(w *Writer) {
 // Unmarshal ...
 func (a *CraftCreativeStackRequestAction) Unmarshal(r *Reader) {
 	r.Varuint32(&a.CreativeItemNetworkID)
+}
+
+// CraftRecipeOptionalStackRequestAction is sent when using an anvil. When this action is sent, the
+// CustomNames field in the respective stack request is non-empty and contains the name of the item created
+// using the anvil.
+type CraftRecipeOptionalStackRequestAction struct {
+	// UnknownBytes currently has an unknown usage. It seems to always be 5 zero bytes when using an anvil.
+	UnknownBytes [5]byte
+}
+
+// Marshal ...
+func (c *CraftRecipeOptionalStackRequestAction) Marshal(w *Writer) {
+	for i := 0; i < len(c.UnknownBytes); i++ {
+		w.Uint8(&c.UnknownBytes[i])
+	}
+}
+
+// zeroBytes holds 5 zero bytes.
+var zeroBytes = make([]byte, 5)
+
+// Unmarshal ...
+func (c *CraftRecipeOptionalStackRequestAction) Unmarshal(r *Reader) {
+	for i := 0; i < len(c.UnknownBytes); i++ {
+		r.Uint8(&c.UnknownBytes[i])
+	}
+	if !bytes.Equal(c.UnknownBytes[:], zeroBytes) {
+		panic(fmt.Sprintf("craft recipe optional stack request action unknown bytes are not all 0: %x", c.UnknownBytes))
+	}
 }
 
 // CraftNonImplementedStackRequestAction is an action sent for inventory actions that aren't yet implemented

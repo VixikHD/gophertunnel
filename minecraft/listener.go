@@ -23,7 +23,7 @@ type ListenConfig struct {
 	// default, ErrorLog is set to one equal to the global logger.
 	ErrorLog *log.Logger
 
-	// AuthenticationDisables specifies if authentication of players that join is disabled. If set to true, no
+	// AuthenticationDisabled specifies if authentication of players that join is disabled. If set to true, no
 	// verification will be done to ensure that the player connecting is authenticated using their XBOX Live
 	// account.
 	AuthenticationDisabled bool
@@ -34,7 +34,8 @@ type ListenConfig struct {
 	// accepted into the server.
 	MaximumPlayers int
 
-	// StatusProvider is the ServerStatusProvider of the Listener. When set to nil, the default
+	// StatusProvider is the ServerStatusProvider of the Listener. When set to nil, the default provider,
+	// ListenerStatusProvider, is used as provider.
 	StatusProvider ServerStatusProvider
 
 	// ResourcePacks is a slice of resource packs that the listener may hold. Each client will be asked to
@@ -126,7 +127,7 @@ func Listen(network, address string) (*Listener, error) {
 func (listener *Listener) Accept() (net.Conn, error) {
 	conn, ok := <-listener.incoming
 	if !ok {
-		return nil, fmt.Errorf("accept: listener closed")
+		return nil, &net.OpError{Op: "accept", Net: "minecraft", Addr: listener.Addr(), Err: errListenerClosed}
 	}
 	return conn, nil
 }

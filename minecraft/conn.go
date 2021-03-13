@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/sandertv/go-raknet"
-	"github.com/sandertv/gophertunnel/internal/dynamic"
+	"github.com/sandertv/gophertunnel/internal"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/login"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
@@ -67,8 +67,9 @@ type Conn struct {
 	identityData login.IdentityData
 	clientData   login.ClientData
 
-	gameData    GameData
-	chunkRadius int
+	gameData         GameData
+	gameDataReceived atomic.Bool
+	chunkRadius      int
 
 	// privateKey is the private key of this end of the connection. Each connection, regardless of which side
 	// the connection is on, server or client, has a unique private key generated.
@@ -92,7 +93,6 @@ type Conn struct {
 	// bufferedSend is a slice of byte slices containing packets that are 'written'. They are buffered until
 	// they are sent each 20th of a second.
 	bufferedSend [][]byte
-	w            *dynamic.Buffer
 	hdr          *packet.Header
 
 	// loggedIn is a bool indicating if the connection was logged in. It is set to true after the entire login
@@ -123,6 +123,8 @@ type Conn struct {
 	packetFunc func(header packet.Header, payload []byte, src, dst net.Addr)
 
 	disconnectMessage atomic.String
+
+	shieldID atomic.Int32
 }
 
 // newConn creates a new Minecraft connection for the net.Conn passed, reading and writing compressed
@@ -134,7 +136,6 @@ func newConn(netConn net.Conn, key *ecdsa.PrivateKey, log *log.Logger) *Conn {
 		enc:         packet.NewEncoder(netConn),
 		dec:         packet.NewDecoder(netConn),
 		pool:        packet.NewPool(),
-		w:           dynamic.NewBuffer(make([]byte, 0, 4096)),
 		salt:        make([]byte, 16),
 		packets:     make(chan *packetData, 8),
 		close:       make(chan struct{}),
@@ -212,18 +213,27 @@ func (conn *Conn) StartGameTimeout(data GameData, timeout time.Duration) error {
 // be used to spawn the player in the world of the server. To spawn a Conn obtained from a call to
 // minecraft.Dial(), use Conn.DoSpawn().
 func (conn *Conn) StartGameContext(ctx context.Context, data GameData) error {
+	if conn.gameDataReceived.Load() {
+		panic("(*Conn).StartGame must only be called on Listener connections")
+	}
 	if data.WorldName == "" {
 		data.WorldName = conn.gameData.WorldName
 	}
+
 	conn.gameData = data
+	for _, item := range data.Items {
+		if item.Name == "minecraft:shield" {
+			conn.shieldID.Store(int32(item.RuntimeID))
+		}
+	}
 	conn.waitingForSpawn.Store(true)
 	conn.startGame()
 
 	select {
 	case <-conn.close:
-		return fmt.Errorf("connection closed")
+		return conn.closeErr("start game")
 	case <-ctx.Done():
-		return fmt.Errorf("start game spawning timeout")
+		return conn.wrap(ctx.Err(), "start game")
 	case <-conn.spawn:
 		// Conn was spawned successfully.
 		return nil
@@ -259,16 +269,16 @@ func (conn *Conn) DoSpawnTimeout(timeout time.Duration) error {
 // DoSpawnContext will start the spawning sequence using the game data found in conn.GameData(), which was
 // sent earlier by the server.
 func (conn *Conn) DoSpawnContext(ctx context.Context) error {
+	if !conn.gameDataReceived.Load() {
+		panic("(*Conn).DoSpawn must only be called on Dialer connections")
+	}
 	conn.waitingForSpawn.Store(true)
 
 	select {
 	case <-conn.close:
-		if conn.disconnectMessage.Load() != "" {
-			return fmt.Errorf("disconnected while spawning: %v", conn.disconnectMessage.Load())
-		}
-		return fmt.Errorf("connection closed")
+		return conn.closeErr("do spawn")
 	case <-ctx.Done():
-		return fmt.Errorf("start game spawning timeout")
+		return conn.wrap(ctx.Err(), "do spawn")
 	case <-conn.spawn:
 		// Conn was spawned successfully.
 		return nil
@@ -280,23 +290,29 @@ func (conn *Conn) DoSpawnContext(ctx context.Context) error {
 func (conn *Conn) WritePacket(pk packet.Packet) error {
 	select {
 	case <-conn.close:
-		return fmt.Errorf("connection closed")
+		return conn.closeErr("write packet")
 	default:
 	}
 	conn.sendMu.Lock()
 	defer conn.sendMu.Unlock()
 
-	conn.hdr.PacketID = pk.ID()
-	_ = conn.hdr.Write(conn.w)
-	l := conn.w.Len()
+	buf := internal.BufferPool.Get().(*bytes.Buffer)
+	defer func() {
+		// Reset the buffer so we can return it to the buffer pool safely.
+		buf.Reset()
+		internal.BufferPool.Put(buf)
+	}()
 
-	pk.Marshal(protocol.NewWriter(conn.w))
+	conn.hdr.PacketID = pk.ID()
+	_ = conn.hdr.Write(buf)
+	l := buf.Len()
+
+	pk.Marshal(protocol.NewWriter(buf, conn.shieldID.Load()))
 	if conn.packetFunc != nil {
-		conn.packetFunc(*conn.hdr, conn.w.Bytes()[l:], conn.LocalAddr(), conn.RemoteAddr())
+		conn.packetFunc(*conn.hdr, buf.Bytes()[l:], conn.LocalAddr(), conn.RemoteAddr())
 	}
 
-	conn.bufferedSend = append(conn.bufferedSend, append([]byte(nil), conn.w.Bytes()...))
-	conn.w.Reset()
+	conn.bufferedSend = append(conn.bufferedSend, append([]byte(nil), buf.Bytes()...))
 	return nil
 }
 
@@ -318,9 +334,9 @@ func (conn *Conn) ReadPacket() (pk packet.Packet, err error) {
 
 	select {
 	case <-conn.close:
-		return nil, fmt.Errorf("error reading packet: connection closed")
+		return nil, conn.closeErr("read packet")
 	case <-conn.readDeadline:
-		return nil, fmt.Errorf("error reading packet: read timeout")
+		return nil, conn.wrap(context.DeadlineExceeded, "read packet")
 	case data := <-conn.packets:
 		pk, err := data.decode(conn)
 		if err != nil {
@@ -354,18 +370,18 @@ func (conn *Conn) Write(b []byte) (n int, err error) {
 func (conn *Conn) Read(b []byte) (n int, err error) {
 	if data, ok := conn.takeDeferredPacket(); ok {
 		if len(b) < len(data.full) {
-			return 0, fmt.Errorf("error reading data: A message sent on a Minecraft socket was larger than the buffer used to receive the message into")
+			return 0, conn.wrap(errBufferTooSmall, "read")
 		}
 		return copy(b, data.full), nil
 	}
 	select {
 	case <-conn.close:
-		return 0, fmt.Errorf("error reading packet: connection closed")
+		return 0, conn.closeErr("read")
 	case <-conn.readDeadline:
-		return 0, fmt.Errorf("error reading packet: read timeout")
+		return 0, conn.wrap(context.DeadlineExceeded, "read")
 	case data := <-conn.packets:
 		if len(b) < len(data.full) {
-			return 0, fmt.Errorf("error reading data: A packet sent on a Minecraft connection was larger than the buffer used to receive the message into")
+			return 0, conn.wrap(errBufferTooSmall, "read")
 		}
 		return copy(b, data.full), nil
 	}
@@ -376,17 +392,24 @@ func (conn *Conn) Read(b []byte) (n int, err error) {
 func (conn *Conn) Flush() error {
 	select {
 	case <-conn.close:
-		return fmt.Errorf("connection closed")
+		return conn.closeErr("flush")
 	default:
 	}
 	conn.sendMu.Lock()
 	defer conn.sendMu.Unlock()
 
 	if len(conn.bufferedSend) > 0 {
-		if err := conn.enc.Encode(conn.bufferedSend); err != nil {
-			return fmt.Errorf("error encoding packet batch: %v", err)
+		if err := conn.enc.Encode(conn.bufferedSend); err != nil && !raknet.ErrConnectionClosed(err) {
+			// Should never happen.
+			panic(fmt.Errorf("error encoding packet batch: %v", err))
 		}
-		// Reset the send slice so that we don't accidentally send the same packets.
+		// First manually clear out conn.bufferedSend so that re-using the slice after resetting its length to
+		// 0 doesn't result in an 'invisible' memory leak.
+		for i := range conn.bufferedSend {
+			conn.bufferedSend[i] = nil
+		}
+		// Slice the conn.bufferedSend to a length of 0 so we don't have to re-allocate space in this slice
+		// every time.
 		conn.bufferedSend = conn.bufferedSend[:0]
 	}
 	return nil
@@ -424,7 +447,7 @@ func (conn *Conn) SetDeadline(t time.Time) error {
 // Passing an empty time.Time to the method (time.Time{}) results in the read deadline being cleared.
 func (conn *Conn) SetReadDeadline(t time.Time) error {
 	if t.Before(time.Now()) {
-		return fmt.Errorf("error setting read deadline: time passed is before time.Now()")
+		panic(fmt.Errorf("error setting read deadline: time passed is before time.Now()"))
 	}
 	empty := time.Time{}
 	if t == empty {
@@ -443,10 +466,12 @@ func (conn *Conn) SetWriteDeadline(time.Time) error {
 // Latency returns a rolling average of latency between the sending and the receiving end of the connection.
 // The latency returned is updated continuously and is half the round trip time (RTT).
 func (conn *Conn) Latency() time.Duration {
-	if c, ok := conn.conn.(*raknet.Conn); ok {
+	if c, ok := conn.conn.(interface {
+		Latency() time.Duration
+	}); ok {
 		return c.Latency()
 	}
-	panic(fmt.Sprintf("unexpected connection type %T", conn.conn))
+	panic(fmt.Sprintf("connection type %T has no Latency() time.Duration method", conn.conn))
 }
 
 // ClientCacheEnabled checks if the connection has the client blob cache enabled. If true, the server may send
@@ -473,6 +498,10 @@ func (conn *Conn) takeDeferredPacket() (*packetData, bool) {
 		return nil, false
 	}
 	data := conn.deferredPackets[0]
+	// Explicitly clear out the packet at offset 0. When we slice it to remove the first element, that element
+	// will not be garbage collectable, because the array it's in is still referenced by the slice. Doing this
+	// makes sure garbage collecting the packet is possible.
+	conn.deferredPackets[0] = nil
 	conn.deferredPackets = conn.deferredPackets[1:]
 	return data, true
 }
@@ -629,19 +658,20 @@ func (conn *Conn) handleClientToServerHandshake() error {
 	}
 	pk := &packet.ResourcePacksInfo{TexturePackRequired: conn.texturePacksRequired}
 	for _, pack := range conn.resourcePacks {
-		resourcePack := protocol.ResourcePackInfo{UUID: pack.UUID(), Version: pack.Version(), Size: uint64(pack.Len())}
-		if pack.HasScripts() {
-			// One of the resource packs has scripts, so we set HasScripts in the packet to true.
-			pk.HasScripts = true
-			resourcePack.HasScripts = true
-		}
 		// If it has behaviours, add it to the behaviour pack list. If not, we add it to the texture packs
 		// list.
 		if pack.HasBehaviours() {
-			pk.BehaviourPacks = append(pk.BehaviourPacks, resourcePack)
+			behaviourPack := protocol.BehaviourPackInfo{UUID: pack.UUID(), Version: pack.Version(), Size: uint64(pack.Len())}
+			if pack.HasScripts() {
+				// One of the resource packs has scripts, so we set HasScripts in the packet to true.
+				pk.HasScripts = true
+				behaviourPack.HasScripts = true
+			}
+			pk.BehaviourPacks = append(pk.BehaviourPacks, behaviourPack)
 			continue
 		}
-		pk.TexturePacks = append(pk.TexturePacks, resourcePack)
+		texturePack := protocol.TexturePackInfo{UUID: pack.UUID(), Version: pack.Version(), Size: uint64(pack.Len())}
+		pk.TexturePacks = append(pk.TexturePacks, texturePack)
 	}
 	// Finally we send the packet after the play status.
 	if err := conn.WritePacket(pk); err != nil {
@@ -866,7 +896,7 @@ func (conn *Conn) startGame() {
 		WorldSpawn:                      data.WorldSpawn,
 		GameRules:                       data.GameRules,
 		Time:                            data.Time,
-		Blocks:                          data.Blocks,
+		Blocks:                          data.CustomBlocks,
 		Items:                           data.Items,
 		AchievementsDisabled:            true,
 		Generator:                       1,
@@ -879,6 +909,7 @@ func (conn *Conn) startGame() {
 		ServerAuthoritativeMovementMode: data.ServerAuthoritativeMovementMode,
 		WorldGameMode:                   data.WorldGameMode,
 		ServerAuthoritativeInventory:    data.ServerAuthoritativeInventory,
+		Experiments:                     data.Experiments,
 	})
 	conn.expect(packet.IDRequestChunkRadius, packet.IDSetLocalPlayerAsInitialised)
 }
@@ -903,24 +934,24 @@ func (conn *Conn) nextResourcePackDownload() error {
 func (conn *Conn) handleResourcePackDataInfo(pk *packet.ResourcePackDataInfo) error {
 	id := strings.Split(pk.UUID, "_")[0]
 
-	downloadingPack, ok := conn.packQueue.downloadingPacks[id]
+	pack, ok := conn.packQueue.downloadingPacks[id]
 	if !ok {
 		// We either already downloaded the pack or we got sent an invalid UUID, that did not match any pack
 		// sent in the ResourcePacksInfo packet.
 		return fmt.Errorf("unknown pack to download with UUID %v", id)
 	}
-	if downloadingPack.size != pk.Size {
+	if pack.size != pk.Size {
 		// Size mismatch: The ResourcePacksInfo packet had a size for the pack that did not match with the
 		// size sent here.
 		conn.log.Printf("pack %v had a different size in the ResourcePacksInfo packet than the ResourcePackDataInfo packet\n", id)
-		downloadingPack.size = pk.Size
+		pack.size = pk.Size
 	}
 
 	// Remove the resource pack from the downloading packs and add it to the awaiting packets.
 	delete(conn.packQueue.downloadingPacks, id)
-	conn.packQueue.awaitingPacks[id] = &downloadingPack
+	conn.packQueue.awaitingPacks[id] = &pack
 
-	downloadingPack.chunkSize = pk.DataChunkSize
+	pack.chunkSize = pk.DataChunkSize
 
 	// The client calculates the chunk count by itself: You could in theory send a chunk count of 0 even
 	// though there's data, and the client will still download normally.
@@ -928,29 +959,31 @@ func (conn *Conn) handleResourcePackDataInfo(pk *packet.ResourcePackDataInfo) er
 	if pk.Size%uint64(pk.DataChunkSize) != 0 {
 		chunkCount++
 	}
+
+	idCopy := pk.UUID
 	go func() {
 		for i := uint32(0); i < chunkCount; i++ {
 			_ = conn.WritePacket(&packet.ResourcePackChunkRequest{
-				UUID:       pk.UUID,
+				UUID:       idCopy,
 				ChunkIndex: i,
 			})
 			select {
 			case <-conn.close:
 				return
-			case frag := <-downloadingPack.newFrag:
+			case frag := <-pack.newFrag:
 				// Write the fragment to the full buffer of the downloading resource pack.
-				_, _ = downloadingPack.buf.Write(frag)
+				_, _ = pack.buf.Write(frag)
 			}
 		}
 		conn.packMu.Lock()
 		defer conn.packMu.Unlock()
 
-		if downloadingPack.buf.Len() != int(downloadingPack.size) {
-			conn.log.Printf("incorrect resource pack size: expected %v, but got %v\n", downloadingPack.size, downloadingPack.buf.Len())
+		if pack.buf.Len() != int(pack.size) {
+			conn.log.Printf("incorrect resource pack size: expected %v, but got %v\n", pack.size, pack.buf.Len())
 			return
 		}
 		// First parse the resource pack from the total byte buffer we obtained.
-		pack, err := resource.FromBytes(downloadingPack.buf.Bytes())
+		pack, err := resource.FromBytes(pack.buf.Bytes())
 		if err != nil {
 			conn.log.Printf("invalid full resource pack data for UUID %v: %v\n", id, err)
 			return
@@ -973,23 +1006,23 @@ func (conn *Conn) handleResourcePackDataInfo(pk *packet.ResourcePackDataInfo) er
 // pack that is being downloaded.
 func (conn *Conn) handleResourcePackChunkData(pk *packet.ResourcePackChunkData) error {
 	pk.UUID = strings.Split(pk.UUID, "_")[0]
-	downloadingPack, ok := conn.packQueue.awaitingPacks[pk.UUID]
+	pack, ok := conn.packQueue.awaitingPacks[pk.UUID]
 	if !ok {
 		// We haven't received a ResourcePackDataInfo packet from the server, so we can't use this data to
 		// download a resource pack.
 		return fmt.Errorf("resource pack chunk data for resource pack that was not being downloaded")
 	}
-	lastData := downloadingPack.buf.Len()+int(downloadingPack.chunkSize) >= int(downloadingPack.size)
-	if !lastData && uint32(len(pk.Data)) != downloadingPack.chunkSize {
+	lastData := pack.buf.Len()+int(pack.chunkSize) >= int(pack.size)
+	if !lastData && uint32(len(pk.Data)) != pack.chunkSize {
 		// The chunk data didn't have the full size and wasn't the last data to be sent for the resource pack,
 		// meaning we got too little data.
-		return fmt.Errorf("resource pack chunk data had a length of %v, but expected %v", len(pk.Data), downloadingPack.chunkSize)
+		return fmt.Errorf("resource pack chunk data had a length of %v, but expected %v", len(pk.Data), pack.chunkSize)
 	}
-	if pk.ChunkIndex != downloadingPack.expectedIndex {
-		return fmt.Errorf("resource pack chunk data had chunk index %v, but expected %v", pk.ChunkIndex, downloadingPack.expectedIndex)
+	if pk.ChunkIndex != pack.expectedIndex {
+		return fmt.Errorf("resource pack chunk data had chunk index %v, but expected %v", pk.ChunkIndex, pack.expectedIndex)
 	}
-	downloadingPack.expectedIndex++
-	downloadingPack.newFrag <- pk.Data
+	pack.expectedIndex++
+	pack.newFrag <- pk.Data
 	return nil
 }
 
@@ -1037,6 +1070,7 @@ func (conn *Conn) handleResourcePackChunkRequest(pk *packet.ResourcePackChunkReq
 // handleStartGame handles an incoming StartGame packet. It is the signal that the player has been added to a
 // world, and it obtains most of its dedicated properties.
 func (conn *Conn) handleStartGame(pk *packet.StartGame) error {
+	conn.gameDataReceived.Store(true)
 	conn.gameData = GameData{
 		Difficulty:                      pk.Difficulty,
 		WorldName:                       pk.WorldName,
@@ -1050,11 +1084,17 @@ func (conn *Conn) handleStartGame(pk *packet.StartGame) error {
 		WorldSpawn:                      pk.WorldSpawn,
 		GameRules:                       pk.GameRules,
 		Time:                            pk.Time,
-		Blocks:                          pk.Blocks,
+		CustomBlocks:                    pk.Blocks,
 		Items:                           pk.Items,
 		ServerAuthoritativeMovementMode: pk.ServerAuthoritativeMovementMode,
 		WorldGameMode:                   pk.WorldGameMode,
 		ServerAuthoritativeInventory:    pk.ServerAuthoritativeInventory,
+		Experiments:                     pk.Experiments,
+	}
+	for _, item := range pk.Items {
+		if item.Name == "minecraft:shield" {
+			conn.shieldID.Store(int32(item.RuntimeID))
+		}
 	}
 	// Clear out the start game packet from the pool.
 	conn.pool[packet.IDStartGame] = &packet.StartGame{}
@@ -1190,4 +1230,13 @@ func (conn *Conn) enableEncryption(clientPublicKey *ecdsa.PublicKey) error {
 // expect sets the packet IDs that are next expected to arrive.
 func (conn *Conn) expect(packetIDs ...uint32) {
 	conn.expectedIDs.Store(packetIDs)
+}
+
+// closeErr returns an adequate connection closed error for the op passed. If the connection was closed
+// through a Disconnect packet, the message is contained.
+func (conn *Conn) closeErr(op string) error {
+	if msg := conn.disconnectMessage.Load(); msg != "" {
+		return conn.wrap(DisconnectError(msg), op)
+	}
+	return conn.wrap(errClosed, op)
 }
