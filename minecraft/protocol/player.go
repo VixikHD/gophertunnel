@@ -4,6 +4,43 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	PlayerActionStartBreak = iota
+	PlayerActionAbortBreak
+	PlayerActionStopBreak
+	PlayerActionGetUpdatedBlock
+	PlayerActionDropItem
+	PlayerActionStartSleeping
+	PlayerActionStopSleeping
+	PlayerActionRespawn
+	PlayerActionJump
+	PlayerActionStartSprint
+	PlayerActionStopSprint
+	PlayerActionStartSneak
+	PlayerActionStopSneak
+	PlayerActionCreativePlayerDestroyBlock
+	PlayerActionDimensionChangeDone
+	PlayerActionStartGlide
+	PlayerActionStopGlide
+	PlayerActionBuildDenied
+	PlayerActionContinueBreak
+	PlayerActionChangeSkin
+	PlayerActionSetEnchantmentSeed
+	PlayerActionStartSwimming
+	PlayerActionStopSwimming
+	PlayerActionStartSpinAttack
+	PlayerActionStopSpinAttack
+	PlayerActionStartBuildingBlock
+	PlayerActionBlockPredictDestroy
+	PlayerActionBlockContinueDestroy
+)
+
+const (
+	PlayerMovementModeClient = iota
+	PlayerMovementModeServer
+	PlayerMovementModeServerWithRewind
+)
+
 // PlayerListEntry is an entry found in the PlayerList packet. It represents a single player using the UUID
 // found in the entry, and contains several properties such as the skin.
 type PlayerListEntry struct {
@@ -59,4 +96,41 @@ func PlayerAddEntry(r *Reader, x *PlayerListEntry) {
 	SerialisedSkin(r, &x.Skin)
 	r.Bool(&x.Teacher)
 	r.Bool(&x.Host)
+}
+
+// PlayerMovementSettings ...
+type PlayerMovementSettings struct {
+	// MovementType ...
+	MovementType uint32
+	// RewindHistorySize ...
+	RewindHistorySize uint32
+	// ServerAuthoritativeBlockBreaking ...
+	ServerAuthoritativeBlockBreaking bool
+}
+
+// PlayerMoveSettings ...
+func PlayerMoveSettings(r IO, x *PlayerMovementSettings) {
+	r.Varuint32(&x.MovementType)
+	r.Varuint32(&x.RewindHistorySize)
+	r.Bool(&x.ServerAuthoritativeBlockBreaking)
+}
+
+// PlayerBlockAction ...
+type PlayerBlockAction struct {
+	// Action ...
+	Action uint64
+	// BlockPos ...
+	BlockPos BlockPos
+	// Face ...
+	Face int32
+}
+
+// BlockAction ...
+func BlockAction(r IO, x *PlayerBlockAction) {
+	r.Varuint64(&x.Action)
+	switch x.Action {
+	case PlayerActionStartBreak, PlayerActionAbortBreak, PlayerActionContinueBreak, PlayerActionBlockPredictDestroy, PlayerActionBlockContinueDestroy:
+		r.BlockPos(&x.BlockPos)
+		r.Int32(&x.Face)
+	}
 }
