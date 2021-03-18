@@ -23,7 +23,7 @@ const (
 	PlayerActionStartGlide
 	PlayerActionStopGlide
 	PlayerActionBuildDenied
-	PlayerActionContinueBreak
+	PlayerActionCrackBreak
 	PlayerActionChangeSkin
 	PlayerActionSetEnchantmentSeed
 	PlayerActionStartSwimming
@@ -31,8 +31,8 @@ const (
 	PlayerActionStartSpinAttack
 	PlayerActionStopSpinAttack
 	PlayerActionStartBuildingBlock
-	PlayerActionBlockPredictDestroy
-	PlayerActionBlockContinueDestroy
+	PlayerActionPredictDestroyBlock
+	PlayerActionContinueDestroyBlock
 )
 
 const (
@@ -98,39 +98,48 @@ func PlayerAddEntry(r *Reader, x *PlayerListEntry) {
 	r.Bool(&x.Host)
 }
 
-// PlayerMovementSettings ...
+// PlayerMovementSettings represents the different server authoritative movement settings. These control how
+// the client will provide input to the server.
 type PlayerMovementSettings struct {
-	// MovementType ...
-	MovementType uint32
-	// RewindHistorySize ...
-	RewindHistorySize uint32
-	// ServerAuthoritativeBlockBreaking ...
+	// MovementType specifies the way the server handles player movement. Available options are
+	// packet.AuthoritativeMovementModeClient, packet.AuthoritativeMovementModeServer and
+	// packet.AuthoritativeMovementModeServerWithRewind, where server the server authoritative types result
+	// in the client sending PlayerAuthInput packets instead of MovePlayer packets and the rewind mode
+	// requires sending the tick of movement and several actions.
+	MovementType int32
+	// RewindHistorySize is the amount of history to keep at maximum if MovementType is
+	// packet.AuthoritativeMovementModeServerWithRewind.
+	RewindHistorySize int32
+	// ServerAuthoritativeBlockBreaking specifies if block breaking should be sent through
+	// packet.PlayerAuthInput or not. This field is somewhat redundant as it is always enabled if
+	// MovementType is packet.AuthoritativeMovementModeServer or
+	// packet.AuthoritativeMovementModeServerWithRewind
 	ServerAuthoritativeBlockBreaking bool
 }
 
-// PlayerMoveSettings ...
+// PlayerMoveSettings reads/writes PlayerMovementSettings x to/from IO r.
 func PlayerMoveSettings(r IO, x *PlayerMovementSettings) {
-	r.Varuint32(&x.MovementType)
-	r.Varuint32(&x.RewindHistorySize)
+	r.Varint32(&x.MovementType)
+	r.Varint32(&x.RewindHistorySize)
 	r.Bool(&x.ServerAuthoritativeBlockBreaking)
 }
 
 // PlayerBlockAction ...
 type PlayerBlockAction struct {
-	// Action ...
-	Action uint64
-	// BlockPos ...
+	// Action is the action to be performed, and is one of the constants listed above.
+	Action int32
+	// BlockPos is the position of the block that was interacted with.
 	BlockPos BlockPos
-	// Face ...
+	// Face is the face of the block that was interacted with.
 	Face int32
 }
 
-// BlockAction ...
+// BlockAction reads/writes a PlayerBlockAction x to/from IO r.
 func BlockAction(r IO, x *PlayerBlockAction) {
-	r.Varuint64(&x.Action)
+	r.Varint32(&x.Action)
 	switch x.Action {
-	case PlayerActionStartBreak, PlayerActionAbortBreak, PlayerActionContinueBreak, PlayerActionBlockPredictDestroy, PlayerActionBlockContinueDestroy:
+	case PlayerActionStartBreak, PlayerActionAbortBreak, PlayerActionCrackBreak, PlayerActionPredictDestroyBlock, PlayerActionContinueDestroyBlock:
 		r.BlockPos(&x.BlockPos)
-		r.Int32(&x.Face)
+		r.Varint32(&x.Face)
 	}
 }

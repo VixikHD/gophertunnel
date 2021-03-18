@@ -39,6 +39,7 @@ const (
 	InputFlagStopSwimming
 	InputFlagStartJumping
 	InputFlagStartGliding
+	InputFlagStopGliding
 	InputFlagPerformItemInteraction
 	InputFlagPerformBlockActions
 	InputFlagPerformItemStackRequest
@@ -96,11 +97,11 @@ type PlayerAuthInput struct {
 	// Delta was the delta between the old and the new position. There isn't any practical use for this field
 	// as it can be calculated by the server itself.
 	Delta mgl32.Vec3
-	// ItemInteractionData ...
+	// ItemInteractionData is the transaction data if the InputData includes an item interaction.
 	ItemInteractionData protocol.UseItemTransactionData
-	// ItemStackRequest ...
+	// ItemStackRequest is sent by the client to change an item in their inventory.
 	ItemStackRequest protocol.ItemStackRequest
-	// BlockActions ...
+	// BlockActions is a slice of block actions that the client has interacted with.
 	BlockActions []protocol.PlayerBlockAction
 }
 
@@ -126,14 +127,28 @@ func (pk *PlayerAuthInput) Marshal(w *protocol.Writer) {
 	w.Vec3(&pk.Delta)
 
 	if pk.InputData&InputFlagPerformItemInteraction != 0 {
-		// Doesn't use the BlockRuntimeID field from the transaction data so we cannot use the same Marshal method.
+		w.Varint32(&pk.ItemInteractionData.LegacyRequestID)
+		if pk.ItemInteractionData.LegacyRequestID != 0 {
+			l := uint32(len(pk.ItemInteractionData.LegacySetItemSlots))
+			w.Varuint32(&l)
+			for _, slot := range pk.ItemInteractionData.LegacySetItemSlots {
+				protocol.SetItemSlot(w, &slot)
+			}
+		}
+		w.Bool(&pk.ItemInteractionData.HasNetworkIDs)
+		l := uint32(len(pk.ItemInteractionData.Actions))
+		w.Varuint32(&l)
+		for _, a := range pk.ItemInteractionData.Actions {
+			protocol.InvAction(w, &a, pk.ItemInteractionData.HasNetworkIDs)
+		}
 		w.Varuint32(&pk.ItemInteractionData.ActionType)
-		w.UBlockPos(&pk.ItemInteractionData.BlockPosition)
+		w.BlockPos(&pk.ItemInteractionData.BlockPosition)
 		w.Varint32(&pk.ItemInteractionData.BlockFace)
 		w.Varint32(&pk.ItemInteractionData.HotBarSlot)
 		w.Item(&pk.ItemInteractionData.HeldItem)
 		w.Vec3(&pk.ItemInteractionData.Position)
 		w.Vec3(&pk.ItemInteractionData.ClickedPosition)
+		w.Varuint32(&pk.ItemInteractionData.BlockRuntimeID)
 	}
 
 	if pk.InputData&InputFlagPerformItemStackRequest != 0 {
@@ -141,8 +156,8 @@ func (pk *PlayerAuthInput) Marshal(w *protocol.Writer) {
 	}
 
 	if pk.InputData&InputFlagPerformBlockActions != 0 {
-		l := uint32(len(pk.BlockActions))
-		w.Varuint32(&l)
+		l := int32(len(pk.BlockActions))
+		w.Varint32(&l)
 		for _, action := range pk.BlockActions {
 			protocol.BlockAction(w, &action)
 		}
@@ -166,7 +181,21 @@ func (pk *PlayerAuthInput) Unmarshal(r *protocol.Reader) {
 	r.Vec3(&pk.Delta)
 
 	if pk.InputData&InputFlagPerformItemInteraction != 0 {
-		// Doesn't use the BlockRuntimeID field from the transaction data so we cannot use the same Unmarshal method.
+		r.Varint32(&pk.ItemInteractionData.LegacyRequestID)
+		if pk.ItemInteractionData.LegacyRequestID != 0 {
+			l := uint32(len(pk.ItemInteractionData.LegacySetItemSlots))
+			r.Varuint32(&l)
+			for _, slot := range pk.ItemInteractionData.LegacySetItemSlots {
+				protocol.SetItemSlot(r, &slot)
+			}
+		}
+		r.Bool(&pk.ItemInteractionData.HasNetworkIDs)
+		var l uint32
+		r.Varuint32(&l)
+		pk.ItemInteractionData.Actions = make([]protocol.InventoryAction, l)
+		for i := uint32(0); i < l; i++ {
+			protocol.InvAction(r, &pk.ItemInteractionData.Actions[i], pk.ItemInteractionData.HasNetworkIDs)
+		}
 		r.Varuint32(&pk.ItemInteractionData.ActionType)
 		r.BlockPos(&pk.ItemInteractionData.BlockPosition)
 		r.Varint32(&pk.ItemInteractionData.BlockFace)
@@ -174,6 +203,7 @@ func (pk *PlayerAuthInput) Unmarshal(r *protocol.Reader) {
 		r.Item(&pk.ItemInteractionData.HeldItem)
 		r.Vec3(&pk.ItemInteractionData.Position)
 		r.Vec3(&pk.ItemInteractionData.ClickedPosition)
+		r.Varuint32(&pk.ItemInteractionData.BlockRuntimeID)
 	}
 
 	if pk.InputData&InputFlagPerformItemStackRequest != 0 {
@@ -181,10 +211,10 @@ func (pk *PlayerAuthInput) Unmarshal(r *protocol.Reader) {
 	}
 
 	if pk.InputData&InputFlagPerformBlockActions != 0 {
-		var l uint32
-		r.Varuint32(&l)
+		var l int32
+		r.Varint32(&l)
 		pk.BlockActions = make([]protocol.PlayerBlockAction, l)
-		for i := uint32(0); i < l; i++ {
+		for i := int32(0); i < l; i++ {
 			protocol.BlockAction(r, &pk.BlockActions[i])
 		}
 	}
